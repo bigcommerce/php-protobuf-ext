@@ -30,6 +30,14 @@
 
 #define PROTOBUF_G(v) ZEND_MODULE_GLOBALS_ACCESSOR(protobuf, v)
 
+// Pool cache entry for keyed multi-pool support.
+typedef struct {
+  char* key;                // strdup'd, persistent
+  upb_DefPool* symtab;
+  HashTable name_msg_cache; // persistent=1
+  HashTable name_enum_cache; // persistent=1
+} pool_cache_entry;
+
 // clang-format off
 ZEND_BEGIN_MODULE_GLOBALS(protobuf)
   // Set by the user to make the descriptor pool persist between requests.
@@ -56,6 +64,12 @@ ZEND_BEGIN_MODULE_GLOBALS(protobuf)
   // actually write a class entry destructor, we reference them here, to be
   // destroyed on request shutdown.
   HashTable descriptors;
+
+  // Keyed multi-pool cache: allows multiple descriptor pools to coexist,
+  // each keyed by a per-request string (e.g., release name).
+  char* descriptor_pool_key;      // INI string, managed by Zend
+  pool_cache_entry* pool_cache;   // malloc'd array of cached pools
+  int pool_cache_count;           // number of entries in pool_cache
 ZEND_END_MODULE_GLOBALS(protobuf)
 // clang-format on
 
@@ -129,12 +143,25 @@ upb_DefPool* get_global_symtab() { return PROTOBUF_G(global_symtab); }
 //     discouraged by the documentation: https://serverfault.com/a/231660
 
 static PHP_GSHUTDOWN_FUNCTION(protobuf) {
-  if (protobuf_globals->global_symtab) {
+  if (protobuf_globals->pool_cache_count > 0) {
+    for (int i = 0; i < protobuf_globals->pool_cache_count; i++) {
+      zend_hash_destroy(&protobuf_globals->pool_cache[i].name_msg_cache);
+      zend_hash_destroy(&protobuf_globals->pool_cache[i].name_enum_cache);
+      upb_DefPool_Free(protobuf_globals->pool_cache[i].symtab);
+      free(protobuf_globals->pool_cache[i].key);
+    }
+    free(protobuf_globals->pool_cache);
+    protobuf_globals->global_symtab = NULL; /* was freed as part of a cache entry */
+  } else if (protobuf_globals->global_symtab) {
     free_protobuf_globals(protobuf_globals);
   }
 }
 
-static PHP_GINIT_FUNCTION(protobuf) { protobuf_globals->global_symtab = NULL; }
+static PHP_GINIT_FUNCTION(protobuf) {
+  protobuf_globals->global_symtab = NULL;
+  protobuf_globals->pool_cache = NULL;
+  protobuf_globals->pool_cache_count = 0;
+}
 
 /**
  * PHP_RINIT_FUNCTION(protobuf)
@@ -142,13 +169,46 @@ static PHP_GINIT_FUNCTION(protobuf) { protobuf_globals->global_symtab = NULL; }
  * This function is run at the beginning of processing each request.
  */
 static PHP_RINIT_FUNCTION(protobuf) {
-  // Create the global generated pool.
-  // Reuse the symtab (if any) left to us by the last request.
-  if (!PROTOBUF_G(global_symtab)) {
-    zend_bool persistent = PROTOBUF_G(keep_descriptor_pool_after_request);
-    PROTOBUF_G(global_symtab) = upb_DefPool_New();
-    zend_hash_init(&PROTOBUF_G(name_msg_cache), 64, NULL, NULL, persistent);
-    zend_hash_init(&PROTOBUF_G(name_enum_cache), 64, NULL, NULL, persistent);
+  char* key = PROTOBUF_G(descriptor_pool_key);
+
+  if (key && key[0] != '\0') {
+    // Keyed mode: look up or create a cache entry.
+    pool_cache_entry* found = NULL;
+    for (int i = 0; i < PROTOBUF_G(pool_cache_count); i++) {
+      if (strcmp(PROTOBUF_G(pool_cache)[i].key, key) == 0) {
+        found = &PROTOBUF_G(pool_cache)[i];
+        break;
+      }
+    }
+    if (found) {
+      // Cache HIT: swap in the cached pool.
+      PROTOBUF_G(global_symtab) = found->symtab;
+      PROTOBUF_G(name_msg_cache) = found->name_msg_cache;
+      PROTOBUF_G(name_enum_cache) = found->name_enum_cache;
+    } else {
+      // Cache MISS: create fresh pool, add to cache.
+      int idx = PROTOBUF_G(pool_cache_count)++;
+      PROTOBUF_G(pool_cache) = realloc(
+          PROTOBUF_G(pool_cache),
+          PROTOBUF_G(pool_cache_count) * sizeof(pool_cache_entry));
+
+      PROTOBUF_G(global_symtab) = upb_DefPool_New();
+      zend_hash_init(&PROTOBUF_G(name_msg_cache), 64, NULL, NULL, 1);
+      zend_hash_init(&PROTOBUF_G(name_enum_cache), 64, NULL, NULL, 1);
+
+      PROTOBUF_G(pool_cache)[idx].key = strdup(key);
+      PROTOBUF_G(pool_cache)[idx].symtab = PROTOBUF_G(global_symtab);
+      PROTOBUF_G(pool_cache)[idx].name_msg_cache = PROTOBUF_G(name_msg_cache);
+      PROTOBUF_G(pool_cache)[idx].name_enum_cache = PROTOBUF_G(name_enum_cache);
+    }
+  } else {
+    // Unkeyed mode: existing behavior unchanged.
+    if (!PROTOBUF_G(global_symtab)) {
+      zend_bool persistent = PROTOBUF_G(keep_descriptor_pool_after_request);
+      PROTOBUF_G(global_symtab) = upb_DefPool_New();
+      zend_hash_init(&PROTOBUF_G(name_msg_cache), 64, NULL, NULL, persistent);
+      zend_hash_init(&PROTOBUF_G(name_enum_cache), 64, NULL, NULL, persistent);
+    }
   }
 
   zend_hash_init(&PROTOBUF_G(object_cache), 64, NULL, NULL, 0);
@@ -164,8 +224,21 @@ static PHP_RINIT_FUNCTION(protobuf) {
  * This function is run at the end of processing each request.
  */
 static PHP_RSHUTDOWN_FUNCTION(protobuf) {
-  // Preserve the symtab if requested.
-  if (!PROTOBUF_G(keep_descriptor_pool_after_request)) {
+  char* key = PROTOBUF_G(descriptor_pool_key);
+
+  if (key && key[0] != '\0' && PROTOBUF_G(keep_descriptor_pool_after_request)) {
+    // Keyed mode: save back the (possibly grown) state to the cache entry.
+    for (int i = 0; i < PROTOBUF_G(pool_cache_count); i++) {
+      if (strcmp(PROTOBUF_G(pool_cache)[i].key, key) == 0) {
+        PROTOBUF_G(pool_cache)[i].symtab = PROTOBUF_G(global_symtab);
+        PROTOBUF_G(pool_cache)[i].name_msg_cache = PROTOBUF_G(name_msg_cache);
+        PROTOBUF_G(pool_cache)[i].name_enum_cache = PROTOBUF_G(name_enum_cache);
+        break;
+      }
+    }
+    // NULL out so unkeyed RINIT doesn't reuse a keyed pool.
+    PROTOBUF_G(global_symtab) = NULL;
+  } else if (!PROTOBUF_G(keep_descriptor_pool_after_request)) {
     free_protobuf_globals(ZEND_MODULE_GLOBALS_BULK(protobuf));
   }
 
@@ -282,6 +355,9 @@ static const zend_module_dep protobuf_deps[] = {ZEND_MOD_OPTIONAL("date")
 PHP_INI_BEGIN()
 STD_PHP_INI_ENTRY("protobuf.keep_descriptor_pool_after_request", "0",
                   PHP_INI_ALL, OnUpdateBool, keep_descriptor_pool_after_request,
+                  zend_protobuf_globals, protobuf_globals)
+STD_PHP_INI_ENTRY("protobuf.descriptor_pool_key", "",
+                  PHP_INI_ALL, OnUpdateString, descriptor_pool_key,
                   zend_protobuf_globals, protobuf_globals)
 PHP_INI_END()
 
