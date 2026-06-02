@@ -2,14 +2,7 @@ name: Integration test
 
 on:
   push:
-    branches: [poc]
-    paths:
-      - 'tests/integration/**'
-      - 'src/php/ext/google/protobuf/**'
-      - 'src/third_party/utf8_range/**'
-      - '.github/workflows/integration.yml'
-  pull_request:
-    branches: [poc]
+    branches: ['*-bc']
     paths:
       - 'tests/integration/**'
       - 'src/php/ext/google/protobuf/**'
