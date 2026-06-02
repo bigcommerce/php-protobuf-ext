@@ -1,0 +1,27 @@
+name: Integration test
+
+on:
+  push:
+    branches: [poc]
+    paths:
+      - 'tests/integration/**'
+      - 'src/php/ext/google/protobuf/**'
+      - 'src/third_party/utf8_range/**'
+      - '.github/workflows/integration.yml'
+  pull_request:
+    branches: [poc]
+    paths:
+      - 'tests/integration/**'
+      - 'src/php/ext/google/protobuf/**'
+      - 'src/third_party/utf8_range/**'
+      - '.github/workflows/integration.yml'
+  workflow_dispatch:
+
+jobs:
+  integration:
+    name: Keyed multi-pool descriptor cache
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Run integration test
+        run: bash tests/integration/run.sh
