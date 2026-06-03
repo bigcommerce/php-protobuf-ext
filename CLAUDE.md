@@ -38,3 +38,13 @@ gh workflow run sync.yml
 ## Initial sync
 
 On first sync (when `composer.json` version is `0.0.0`), only the last 5 upstream releases are synced. After that, all new releases are synced as they appear.
+
+## BigCommerce modifications
+
+The `*-bc` branches (e.g. `35.0-bc`) carry a local patch — the **keyed multi-pool
+descriptor cache** (INFRA-25160) — applied on top of the synced upstream source in
+`src/php/ext/google/protobuf/protobuf.c`. Because a sync overwrites `src/`, the patch must
+be re-applied after each upstream sync.
+
+See [`docs/multi-pool-descriptor-cache.md`](docs/multi-pool-descriptor-cache.md) for the
+what/why, production setup, packaging, and the cross-sync maintenance workflow.

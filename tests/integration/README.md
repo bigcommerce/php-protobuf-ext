@@ -1,0 +1,44 @@
+# Integration test — keyed multi-pool descriptor cache
+
+Proves the [keyed multi-pool descriptor cache patch](../../docs/multi-pool-descriptor-cache.md)
+works end-to-end, in the only environment that can exercise it: a **persistent FastCGI
+worker**. The fixed behavior is inherently cross-request (the pool must survive
+`RSHUTDOWN`→`RINIT`), so a `.phpt` (single CLI request) or `php -S` can't reproduce it.
+
+## Stack
+
+- **php** — `php:8.4-fpm-bookworm` with the protobuf extension built from this repo's own
+  `src/` (so the test always covers the committed patch). `pm=static`, `pm.max_children=1`
+  → one worker, making cross-request reuse deterministic.
+  `protobuf.keep_descriptor_pool_after_request=1`.
+- **web** — nginx mapping the `x-release` header to a release docroot. Each release's
+  `public/.user.ini` carries its `protobuf.descriptor_pool_key`. Unknown release → 400.
+
+| Release  | Proto pkg | key   | Role                                                            |
+|----------|-----------|-------|----------------------------------------------------------------|
+| `v1-foo` | v1        | `v1`  | First load of pool `v1`.                                       |
+| `v1-bar` | v1        | `v1`  | Different release, same key → must **reuse** `v1-foo`'s pool.  |
+| `v2`     | v2        | `v2`  | Conflicting proto (same FQCN, extra `id`) → separate, coexists.|
+| `compat` | v1        | *none*| Empty key → unkeyed/upstream path still works.                 |
+
+The keys `v1`/`v2` stand in for production `composer.lock` checksums.
+
+## Run
+
+```bash
+bash tests/integration/run.sh   # builds, waits, asserts, tears down; prints PASS / exits non-zero
+```
+
+Needs Docker + Compose (the script auto-detects `docker compose` vs `docker-compose`).
+
+## What it asserts
+
+- **Same key = reuse** — `v1-bar`'s `before v1=true` proves it adopted the pool `v1-foo`
+  built, across two distinct releases, with no rebuild.
+- **Different key = coexistence** — `v2` sees `v1=false`, exposes its own `id` field, and a
+  warm alternation loop between `v1-foo`/`v2` never 500s (the prevented "No such property"
+  fatal would surface as a non-zero `curl -f`).
+- **Empty key = backward compatible** — `compat` (no `.user.ini`) works on the unkeyed path.
+
+To confirm the harness actually detects the bug, temporarily set `v2`'s `.user.ini` key to
+`v1` (forcing both protos onto one pool) — `run.sh` should then FAIL on the `v2` request.
