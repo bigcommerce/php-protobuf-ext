@@ -5,6 +5,7 @@ on:
     branches: ['*-bc']
     paths:
       - 'tests/integration/**'
+      - 'tests/uaf/**'
       - 'src/php/ext/google/protobuf/**'
       - 'src/third_party/utf8_range/**'
       - '.github/workflows/integration.yml'
@@ -18,3 +19,16 @@ jobs:
       - uses: actions/checkout@v6
       - name: Run integration test
         run: bash tests/integration/run.sh
+
+  uaf:
+    name: Use-after-free guard (MALLOC_PERTURB_)
+    runs-on: ubuntu-latest
+    container: php:8.4-cli-bookworm
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install build toolchain
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends autoconf gcc make curl
+      - name: Run use-after-free guard
+        run: bash tests/uaf/run.sh

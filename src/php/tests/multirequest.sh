@@ -24,7 +24,15 @@ run_test() {
         shift
         ;;
       --keep_descriptors)
-        EXTRA_ARGS=-dprotobuf.keep_descriptor_pool_after_request=1
+        EXTRA_ARGS="$EXTRA_ARGS -dprotobuf.keep_descriptor_pool_after_request=1"
+        shift
+        ;;
+      --pool_key)
+        # descriptor_pool_key selects the keyed multi-pool cache (only effective
+        # together with keep_descriptor_pool_after_request). Two same-key requests
+        # must not crash: with keep they reuse the cached pool; without keep the key
+        # is ignored and the legacy unkeyed path runs. Either way, no use-after-free.
+        EXTRA_ARGS="$EXTRA_ARGS -dprotobuf.descriptor_pool_key=multirequest"
         shift
         ;;
     esac
@@ -60,3 +68,11 @@ run_test
 run_test --keep_descriptors
 run_test --valgrind
 run_test --valgrind --keep_descriptors
+
+# Keyed multi-pool cache. --pool_key alone (keep unset) is the regression test for
+# the use-after-free where RINIT registered a keyed pool in pool_cache that
+# RSHUTDOWN then freed, crashing the second same-key request.
+run_test --pool_key
+run_test --pool_key --keep_descriptors
+run_test --valgrind --pool_key
+run_test --valgrind --pool_key --keep_descriptors

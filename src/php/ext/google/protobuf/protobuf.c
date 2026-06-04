@@ -171,8 +171,14 @@ static PHP_GINIT_FUNCTION(protobuf) {
 static PHP_RINIT_FUNCTION(protobuf) {
   char* key = PROTOBUF_G(descriptor_pool_key);
 
-  if (key && key[0] != '\0') {
-    // Keyed mode: look up or create a cache entry.
+  if (key && key[0] != '\0' && PROTOBUF_G(keep_descriptor_pool_after_request)) {
+    // Keyed mode: look up or create a cache entry. This requires
+    // keep_descriptor_pool_after_request -- the keyed cache only makes sense for
+    // pools that persist across requests. When keep is off, descriptor_pool_key is
+    // ignored and the unkeyed path below runs (upstream behavior). This gate MUST
+    // match RSHUTDOWN's: registering a pool here but freeing it there (the original
+    // bug, where RINIT keyed on the key alone while RSHUTDOWN also required keep)
+    // leaves a dangling pointer in pool_cache and crashes the next same-key request.
     pool_cache_entry* found = NULL;
     for (int i = 0; i < PROTOBUF_G(pool_cache_count); i++) {
       if (strcmp(PROTOBUF_G(pool_cache)[i].key, key) == 0) {
@@ -192,6 +198,8 @@ static PHP_RINIT_FUNCTION(protobuf) {
           PROTOBUF_G(pool_cache),
           PROTOBUF_G(pool_cache_count) * sizeof(pool_cache_entry));
 
+      // Keyed pools are persistent (persistent=1): they outlive the request in
+      // pool_cache and are freed only in GSHUTDOWN, never in RSHUTDOWN.
       PROTOBUF_G(global_symtab) = upb_DefPool_New();
       zend_hash_init(&PROTOBUF_G(name_msg_cache), 64, NULL, NULL, 1);
       zend_hash_init(&PROTOBUF_G(name_enum_cache), 64, NULL, NULL, 1);
@@ -227,7 +235,10 @@ static PHP_RSHUTDOWN_FUNCTION(protobuf) {
   char* key = PROTOBUF_G(descriptor_pool_key);
 
   if (key && key[0] != '\0' && PROTOBUF_G(keep_descriptor_pool_after_request)) {
-    // Keyed mode: save back the (possibly grown) state to the cache entry.
+    // Keyed mode: save the (possibly grown) state back to its cache entry and detach
+    // the request globals WITHOUT freeing them -- the cache owns these pools and
+    // frees them all in GSHUTDOWN at worker teardown. This gate MUST match RINIT's
+    // (both require keep): a pool registered in pool_cache must never be freed here.
     for (int i = 0; i < PROTOBUF_G(pool_cache_count); i++) {
       if (strcmp(PROTOBUF_G(pool_cache)[i].key, key) == 0) {
         PROTOBUF_G(pool_cache)[i].symtab = PROTOBUF_G(global_symtab);

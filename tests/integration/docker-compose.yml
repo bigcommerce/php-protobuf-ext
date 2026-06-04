@@ -3,6 +3,12 @@ services:
     build:
       context: ../..                       # repo root, so the Dockerfile can COPY src/
       dockerfile: tests/integration/docker/php/Dockerfile
+    # Poison freed heap memory so the keep0 use-after-free check is deterministic:
+    # a freed-then-reused descriptor pool reads garbage and fails instead of
+    # silently succeeding on intact stale memory.
+    environment:
+      MALLOC_PERTURB_: "165"
+      USE_ZEND_ALLOC: "0"
     volumes:
       - ./releases:/var/www/releases
   web:

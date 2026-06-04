@@ -40,6 +40,13 @@ Behavior when a non-empty key is set and persistence is on:
   proto definitions never collide.
 - **Empty key** → identical to upstream; single-version deployments are unaffected.
 
+The key only takes effect when persistence is on: keyed mode requires
+`keep_descriptor_pool_after_request=1`. If a key is set while persistence is off, the key is
+**ignored** and the request runs the unkeyed upstream path (a keyed pool would have nothing
+to persist into across requests). Both gates must agree — engaging the keyed cache on the key
+alone, without persistence, leaves a freed pool referenced by the cache on the next same-key
+request (a use-after-free; INFRA-25160).
+
 ## Enabling it
 
 The key is delivered per request via a per-version **`.user.ini`** in the document root
@@ -84,9 +91,15 @@ it installs a built extension into a live PHP environment, whereas fpm-cookery n
 ## Testing
 
 `tests/integration/` is a self-contained docker stack (one pinned PHP-FPM worker + nginx)
-that asserts the behaviors above against the extension built from this repo. See
-[`tests/integration/README.md`](../tests/integration/README.md). CI runs it on `*-bc`
-branches via `.github/workflows/integration.yml`.
+that asserts the behaviors above against the extension built from this repo, including the
+key-ignored-when-`keep=0` case. See [`tests/integration/README.md`](../tests/integration/README.md).
+
+`tests/uaf/` is a lighter-weight, dedicated guard for the use-after-free above: it builds the
+extension and drives the keyed pool across requests under `MALLOC_PERTURB_`, which poisons
+freed memory so a dangling-pool reuse fails deterministically. (AddressSanitizer is not usable
+here — PHP `dlopen`s extensions with `RTLD_DEEPBIND`, which the ASan runtime rejects.)
+
+CI runs both on `*-bc` branches via `.github/workflows/integration.yml`.
 
 ## Maintenance across syncs
 

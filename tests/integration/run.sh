@@ -74,6 +74,16 @@ echo "backward compatibility: empty key still works"
 expect compat  'name=Version 1'
 expect compat  'name=Version 1'
 
+echo "use-after-free guard: key set + keep=0 (key ignored) survives repeated requests"
+# Regression for the keyed-cache UAF: with keep off, the key must be ignored and the
+# legacy unkeyed path used. Before the fix, the first request registered a keyed pool
+# that RSHUTDOWN then freed, so the second same-key request reused freed memory and
+# (under MALLOC_PERTURB_, see docker-compose.yml) failed. Both must now succeed.
+# Only the success + value are asserted; the `before` state depends on whatever
+# unkeyed pool the preceding requests left, since keep=0 takes the unkeyed path.
+expect keep0   'name=Version 1'
+expect keep0   'name=Version 1'
+
 echo "routing guard: unknown release is rejected"
 reject nope
 
