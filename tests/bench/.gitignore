@@ -1,0 +1,5 @@
+# All generated at run time by bench.sh.
+app/proto/bench.proto
+app/gen/
+app/vendor/
+app/composer.lock

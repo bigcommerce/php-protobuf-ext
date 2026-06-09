@@ -1,0 +1,13 @@
+{
+    "name": "pie-extensions/protobuf-bench",
+    "description": "Benchmark app: pure-PHP vs ext (no cache) vs ext (descriptor-pool cache).",
+    "require": {
+        "google/protobuf": "*"
+    },
+    "autoload": {
+        "classmap": ["gen/"]
+    },
+    "config": {
+        "platform-check": false
+    }
+}
