@@ -19,8 +19,8 @@ worker**. The fixed behavior is inherently cross-request (the pool must survive
 | `v1-foo` | v1        | `v1`  | First load of pool `v1`.                                       |
 | `v1-bar` | v1        | `v1`  | Different release, same key → must **reuse** `v1-foo`'s pool.  |
 | `v2`     | v2        | `v2`  | Conflicting proto (same FQCN, extra `id`) → separate, coexists.|
-| `compat` | v1        | *none*| Empty key → unkeyed/upstream path still works.                 |
-| `keep0`  | v1        | `keep0` + `keep=0` | Key set but `keep_descriptor_pool_after_request=0` → key ignored; must survive repeated requests (UAF regression guard). |
+| `compat` | v1        | *none*| Empty key → unkeyed/upstream persistence; its pool must survive keyed and `keep=0` interleaving. |
+| `keep0`  | v1        | `keep0` + `keep=0` | Key set but `keep_descriptor_pool_after_request=0` → key ignored; fully isolated request-local pool (UAF + isolation regression guard). |
 
 The keys `v1`/`v2` stand in for production `composer.lock` checksums.
 
@@ -39,10 +39,15 @@ Needs Docker + Compose (the script auto-detects `docker compose` vs `docker-comp
 - **Different key = coexistence** — `v2` sees `v1=false`, exposes its own `id` field, and a
   warm alternation loop between `v1-foo`/`v2` never 500s (the prevented "No such property"
   fatal would surface as a non-zero `curl -f`).
-- **Empty key = backward compatible** — `compat` (no `.user.ini`) works on the unkeyed path.
-- **Key + `keep=0` = no use-after-free** — `keep0` sets a key but disables persistence, so the
-  key is ignored and the legacy path runs; two consecutive requests must both succeed. Before
-  the fix the first request registered a keyed pool that `RSHUTDOWN` freed, crashing the second.
+- **Empty key = backward compatible and durable** — `compat` (no `.user.ini`) works on the
+  unkeyed persistent path, and its pool survives interleaved keyed requests (`before v1=true`
+  after the alternation loop — previously each unkeyed→keyed transition leaked/clobbered it)
+  and interleaved `keep=0` requests.
+- **Key + `keep=0` = no use-after-free, fully isolated** — `keep0` sets a key but disables
+  persistence, so the key is ignored and a fresh request-local pool is used; two consecutive
+  requests must both succeed with an empty `before` (a `keep=0` request must never adopt —
+  or destroy — a persistent pool). Before the fix the first request registered a keyed pool
+  that `RSHUTDOWN` freed, crashing the second.
 
 To confirm the harness actually detects the bug, temporarily set `v2`'s `.user.ini` key to
 `v1` (forcing both protos onto one pool) — `run.sh` should then FAIL on the `v2` request.

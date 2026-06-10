@@ -66,17 +66,32 @@ ZEND_BEGIN_MODULE_GLOBALS(protobuf)
   HashTable descriptors;
 
   // Keyed multi-pool cache: allows multiple descriptor pools to coexist,
-  // each keyed by a per-request string (e.g., release name).
+  // each keyed by a per-request string (e.g., release name). Every persistent
+  // pool lives in pool_cache -- the unkeyed keep_descriptor_pool_after_request
+  // pool is simply the entry with key "".
   char* descriptor_pool_key;      // INI string, managed by Zend
   pool_cache_entry* pool_cache;   // malloc'd array of cached pools
   int pool_cache_count;           // number of entries in pool_cache
+
+  // The lifecycle decision for the current request, recorded once in RINIT and
+  // consumed by RSHUTDOWN: index of the pool_cache entry this request runs on,
+  // or -1 for a request-local (non-persistent) pool. RSHUTDOWN must never
+  // re-read the INI settings -- both are PHP_INI_ALL, and ini_set() values are
+  // still in effect during RSHUTDOWN (zend_ini_deactivate runs later), so a
+  // mid-request ini_set() could otherwise desynchronize setup from teardown
+  // and free a pool the cache still references.
+  int active_pool_idx;
 ZEND_END_MODULE_GLOBALS(protobuf)
 // clang-format on
 
 void free_protobuf_globals(zend_protobuf_globals* globals) {
   zend_hash_destroy(&globals->name_msg_cache);
   zend_hash_destroy(&globals->name_enum_cache);
-  upb_DefPool_Free(globals->global_symtab);
+  // upb_DefPool_Free is not NULL-safe; global_symtab can be NULL if
+  // upb_DefPool_New failed in RINIT.
+  if (globals->global_symtab) {
+    upb_DefPool_Free(globals->global_symtab);
+  }
   globals->global_symtab = NULL;
 }
 
@@ -147,12 +162,18 @@ static PHP_GSHUTDOWN_FUNCTION(protobuf) {
     for (int i = 0; i < protobuf_globals->pool_cache_count; i++) {
       zend_hash_destroy(&protobuf_globals->pool_cache[i].name_msg_cache);
       zend_hash_destroy(&protobuf_globals->pool_cache[i].name_enum_cache);
-      upb_DefPool_Free(protobuf_globals->pool_cache[i].symtab);
+      if (protobuf_globals->pool_cache[i].symtab) {
+        upb_DefPool_Free(protobuf_globals->pool_cache[i].symtab);
+      }
       free(protobuf_globals->pool_cache[i].key);
     }
     free(protobuf_globals->pool_cache);
+    protobuf_globals->pool_cache = NULL;
+    protobuf_globals->pool_cache_count = 0;
     protobuf_globals->global_symtab = NULL; /* was freed as part of a cache entry */
   } else if (protobuf_globals->global_symtab) {
+    // Defensive: RSHUTDOWN always frees or NULLs global_symtab, so this is
+    // normally unreachable.
     free_protobuf_globals(protobuf_globals);
   }
 }
@@ -161,6 +182,34 @@ static PHP_GINIT_FUNCTION(protobuf) {
   protobuf_globals->global_symtab = NULL;
   protobuf_globals->pool_cache = NULL;
   protobuf_globals->pool_cache_count = 0;
+  protobuf_globals->active_pool_idx = -1;
+}
+
+// Returns the index of the cache entry for `key`, or -1 if absent.
+static int pool_cache_find(const char* key) {
+  for (int i = 0; i < PROTOBUF_G(pool_cache_count); i++) {
+    if (strcmp(PROTOBUF_G(pool_cache)[i].key, key) == 0) return i;
+  }
+  return -1;
+}
+
+// Appends an entry for `key` (symtab/name caches left for the caller to fill)
+// and returns its index, or -1 on allocation failure. pool_cache_count is only
+// incremented once every fallible step has succeeded, so the array and count
+// can never disagree.
+static int pool_cache_insert(const char* key) {
+  pool_cache_entry* grown =
+      realloc(PROTOBUF_G(pool_cache),
+              (PROTOBUF_G(pool_cache_count) + 1) * sizeof(pool_cache_entry));
+  if (!grown) return -1;
+  PROTOBUF_G(pool_cache) = grown;
+
+  char* key_copy = strdup(key);
+  if (!key_copy) return -1;  // array stays grown; count unchanged -- harmless
+
+  int idx = PROTOBUF_G(pool_cache_count)++;
+  PROTOBUF_G(pool_cache)[idx].key = key_copy;
+  return idx;
 }
 
 /**
@@ -169,54 +218,57 @@ static PHP_GINIT_FUNCTION(protobuf) {
  * This function is run at the beginning of processing each request.
  */
 static PHP_RINIT_FUNCTION(protobuf) {
-  char* key = PROTOBUF_G(descriptor_pool_key);
+  // The INI settings are sampled exactly once, here; the decision is recorded
+  // in active_pool_idx and consumed by RSHUTDOWN. A mid-request ini_set() of
+  // either setting therefore has no effect on the pool lifecycle.
+  PROTOBUF_G(active_pool_idx) = -1;
 
-  if (key && key[0] != '\0' && PROTOBUF_G(keep_descriptor_pool_after_request)) {
-    // Keyed mode: look up or create a cache entry. This requires
-    // keep_descriptor_pool_after_request -- the keyed cache only makes sense for
-    // pools that persist across requests. When keep is off, descriptor_pool_key is
-    // ignored and the unkeyed path below runs (upstream behavior). This gate MUST
-    // match RSHUTDOWN's: registering a pool here but freeing it there (the original
-    // bug, where RINIT keyed on the key alone while RSHUTDOWN also required keep)
-    // leaves a dangling pointer in pool_cache and crashes the next same-key request.
-    pool_cache_entry* found = NULL;
-    for (int i = 0; i < PROTOBUF_G(pool_cache_count); i++) {
-      if (strcmp(PROTOBUF_G(pool_cache)[i].key, key) == 0) {
-        found = &PROTOBUF_G(pool_cache)[i];
-        break;
+  if (PROTOBUF_G(keep_descriptor_pool_after_request)) {
+    // Persistent mode: the pool for this request lives in pool_cache, looked up
+    // by descriptor_pool_key; the unkeyed persistent pool is the entry with key
+    // "". Cached pools are persistent (persistent=1) and freed only in
+    // GSHUTDOWN, never in RSHUTDOWN.
+    char* key = PROTOBUF_G(descriptor_pool_key);
+    if (!key) key = "";
+
+    int idx = pool_cache_find(key);
+    if (idx >= 0) {
+      // Cache HIT: swap in the cached pool.
+      PROTOBUF_G(global_symtab) = PROTOBUF_G(pool_cache)[idx].symtab;
+      PROTOBUF_G(name_msg_cache) = PROTOBUF_G(pool_cache)[idx].name_msg_cache;
+      PROTOBUF_G(name_enum_cache) = PROTOBUF_G(pool_cache)[idx].name_enum_cache;
+      PROTOBUF_G(active_pool_idx) = idx;
+    } else {
+      // Cache MISS: create a fresh pool and register it.
+      PROTOBUF_G(global_symtab) = upb_DefPool_New();
+      if (PROTOBUF_G(global_symtab)) {
+        zend_hash_init(&PROTOBUF_G(name_msg_cache), 64, NULL, NULL, 1);
+        zend_hash_init(&PROTOBUF_G(name_enum_cache), 64, NULL, NULL, 1);
+        idx = pool_cache_insert(key);
+        if (idx >= 0) {
+          PROTOBUF_G(pool_cache)[idx].symtab = PROTOBUF_G(global_symtab);
+          PROTOBUF_G(pool_cache)[idx].name_msg_cache =
+              PROTOBUF_G(name_msg_cache);
+          PROTOBUF_G(pool_cache)[idx].name_enum_cache =
+              PROTOBUF_G(name_enum_cache);
+          PROTOBUF_G(active_pool_idx) = idx;
+        }
+        // else: couldn't register (OOM) -- active_pool_idx stays -1, so the
+        // request runs on this pool as request-local and RSHUTDOWN frees it.
+      } else {
+        // Pool allocation failed: still initialize the name caches so
+        // RSHUTDOWN's free path never destroys stale/uninitialized tables.
+        zend_hash_init(&PROTOBUF_G(name_msg_cache), 64, NULL, NULL, 0);
+        zend_hash_init(&PROTOBUF_G(name_enum_cache), 64, NULL, NULL, 0);
       }
     }
-    if (found) {
-      // Cache HIT: swap in the cached pool.
-      PROTOBUF_G(global_symtab) = found->symtab;
-      PROTOBUF_G(name_msg_cache) = found->name_msg_cache;
-      PROTOBUF_G(name_enum_cache) = found->name_enum_cache;
-    } else {
-      // Cache MISS: create fresh pool, add to cache.
-      int idx = PROTOBUF_G(pool_cache_count)++;
-      PROTOBUF_G(pool_cache) = realloc(
-          PROTOBUF_G(pool_cache),
-          PROTOBUF_G(pool_cache_count) * sizeof(pool_cache_entry));
-
-      // Keyed pools are persistent (persistent=1): they outlive the request in
-      // pool_cache and are freed only in GSHUTDOWN, never in RSHUTDOWN.
-      PROTOBUF_G(global_symtab) = upb_DefPool_New();
-      zend_hash_init(&PROTOBUF_G(name_msg_cache), 64, NULL, NULL, 1);
-      zend_hash_init(&PROTOBUF_G(name_enum_cache), 64, NULL, NULL, 1);
-
-      PROTOBUF_G(pool_cache)[idx].key = strdup(key);
-      PROTOBUF_G(pool_cache)[idx].symtab = PROTOBUF_G(global_symtab);
-      PROTOBUF_G(pool_cache)[idx].name_msg_cache = PROTOBUF_G(name_msg_cache);
-      PROTOBUF_G(pool_cache)[idx].name_enum_cache = PROTOBUF_G(name_enum_cache);
-    }
   } else {
-    // Unkeyed mode: existing behavior unchanged.
-    if (!PROTOBUF_G(global_symtab)) {
-      zend_bool persistent = PROTOBUF_G(keep_descriptor_pool_after_request);
-      PROTOBUF_G(global_symtab) = upb_DefPool_New();
-      zend_hash_init(&PROTOBUF_G(name_msg_cache), 64, NULL, NULL, persistent);
-      zend_hash_init(&PROTOBUF_G(name_enum_cache), 64, NULL, NULL, persistent);
-    }
+    // Request-local mode (upstream default): fresh pool, freed in RSHUTDOWN.
+    // descriptor_pool_key is ignored -- a keyed pool would have nothing to
+    // persist into across requests.
+    PROTOBUF_G(global_symtab) = upb_DefPool_New();
+    zend_hash_init(&PROTOBUF_G(name_msg_cache), 64, NULL, NULL, 0);
+    zend_hash_init(&PROTOBUF_G(name_enum_cache), 64, NULL, NULL, 0);
   }
 
   zend_hash_init(&PROTOBUF_G(object_cache), 64, NULL, NULL, 0);
@@ -232,24 +284,27 @@ static PHP_RINIT_FUNCTION(protobuf) {
  * This function is run at the end of processing each request.
  */
 static PHP_RSHUTDOWN_FUNCTION(protobuf) {
-  char* key = PROTOBUF_G(descriptor_pool_key);
+  // Consume the decision RINIT recorded. The INI settings are deliberately NOT
+  // re-read here: ini_set() values are still in effect during RSHUTDOWN
+  // (zend_ini_deactivate runs later), so re-reading them could free a pool
+  // that pool_cache still references, or preserve request-local allocations.
+  int idx = PROTOBUF_G(active_pool_idx);
+  PROTOBUF_G(active_pool_idx) = -1;
 
-  if (key && key[0] != '\0' && PROTOBUF_G(keep_descriptor_pool_after_request)) {
-    // Keyed mode: save the (possibly grown) state back to its cache entry and detach
-    // the request globals WITHOUT freeing them -- the cache owns these pools and
-    // frees them all in GSHUTDOWN at worker teardown. This gate MUST match RINIT's
-    // (both require keep): a pool registered in pool_cache must never be freed here.
-    for (int i = 0; i < PROTOBUF_G(pool_cache_count); i++) {
-      if (strcmp(PROTOBUF_G(pool_cache)[i].key, key) == 0) {
-        PROTOBUF_G(pool_cache)[i].symtab = PROTOBUF_G(global_symtab);
-        PROTOBUF_G(pool_cache)[i].name_msg_cache = PROTOBUF_G(name_msg_cache);
-        PROTOBUF_G(pool_cache)[i].name_enum_cache = PROTOBUF_G(name_enum_cache);
-        break;
-      }
+  if (idx >= 0) {
+    // Persistent pool: save the (possibly grown) state back to its cache entry
+    // and detach the request globals WITHOUT freeing them -- the cache owns
+    // these pools and frees them all in GSHUTDOWN at worker teardown. The
+    // HashTables are stored by value, so growth during the request (realloc'd
+    // arData, new counts) only exists in the globals' copy until saved back.
+    if (PROTOBUF_G(global_symtab)) {
+      PROTOBUF_G(pool_cache)[idx].symtab = PROTOBUF_G(global_symtab);
+      PROTOBUF_G(pool_cache)[idx].name_msg_cache = PROTOBUF_G(name_msg_cache);
+      PROTOBUF_G(pool_cache)[idx].name_enum_cache = PROTOBUF_G(name_enum_cache);
     }
-    // NULL out so unkeyed RINIT doesn't reuse a keyed pool.
     PROTOBUF_G(global_symtab) = NULL;
-  } else if (!PROTOBUF_G(keep_descriptor_pool_after_request)) {
+  } else {
+    // Request-local pool: free it.
     free_protobuf_globals(ZEND_MODULE_GLOBALS_BULK(protobuf));
   }
 

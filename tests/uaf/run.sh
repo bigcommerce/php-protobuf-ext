@@ -13,9 +13,12 @@
 # Run inside php:8.4-cli-bookworm with a build toolchain (autoconf gcc make curl);
 # see .github/workflows/integration.yml.
 #
-# Two scenarios, both must pass cleanly:
+# Three scenarios, all must pass cleanly:
 #   1. key set, keep=0  -> key must be ignored (legacy path); the original UAF case
 #   2. key set, keep=1  -> the production keyed path
+#   3. key set, keep=1, one request ini_set-flips both INIs mid-request -> the
+#      lifecycle decision is snapshotted at RINIT, so the flip must be a no-op;
+#      if RSHUTDOWN re-read the INI it would free the cached pool (UAF next request)
 set -euo pipefail
 cd "$(dirname "$0")/../.."          # repo root
 EXTDIR=src/php/ext/google/protobuf
@@ -36,8 +39,8 @@ popd >/dev/null
 # php.ini/conf.d so only our extension is loaded.
 export MALLOC_PERTURB_=165 USE_ZEND_ALLOC=0
 
-run_scenario() {  # $1 = label  $2.. = extra php -d args
-  local label="$1"; shift
+run_scenario() {  # $1 = label  $2 = space-separated request paths  $3.. = extra php -d args
+  local label="$1" paths="$2"; shift 2
   echo
   echo ">> scenario: $label"
   local log; log=$(mktemp)
@@ -54,11 +57,11 @@ run_scenario() {  # $1 = label  $2.. = extra php -d args
   # Each request is a full RINIT/RSHUTDOWN cycle. A use-after-free surfaces as a
   # crashed/closed connection or an error response -> curl -f fails the run.
   local ok=1
-  for n in 1 2 3 4 5; do
-    if body=$(curl -fsS "127.0.0.1:$PORT/r$n" 2>/dev/null); then
-      echo "   req $n: $body"
+  for p in $paths; do
+    if body=$(curl -fsS "127.0.0.1:$PORT/$p" 2>/dev/null); then
+      echo "   req $p: $body"
     else
-      echo "   req $n: REQUEST FAILED (use-after-free)"; ok=0; break
+      echo "   req $p: REQUEST FAILED (use-after-free)"; ok=0; break
     fi
   done
   kill $srv 2>/dev/null || true; wait 2>/dev/null || true
@@ -67,8 +70,12 @@ run_scenario() {  # $1 = label  $2.. = extra php -d args
   echo "   PASS"
 }
 
-run_scenario "key set, keep=0 (key ignored; original UAF case)"
-run_scenario "key set, keep=1 (production keyed path)" -dprotobuf.keep_descriptor_pool_after_request=1
+run_scenario "key set, keep=0 (key ignored; original UAF case)" \
+  "r1 r2 r3 r4 r5"
+run_scenario "key set, keep=1 (production keyed path)" \
+  "r1 r2 r3 r4 r5" -dprotobuf.keep_descriptor_pool_after_request=1
+run_scenario "key set, keep=1, mid-request ini_set flip (snapshot semantics)" \
+  "r1 flip r3 r4 r5" -dprotobuf.keep_descriptor_pool_after_request=1
 
 echo
 echo "UAF GUARD PASS"

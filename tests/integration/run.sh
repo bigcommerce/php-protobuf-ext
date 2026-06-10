@@ -70,19 +70,25 @@ for _ in 1 2 3; do
   expect v2      'id=123 name=Version 2'
 done
 
-echo "backward compatibility: empty key still works"
-expect compat  'name=Version 1'
-expect compat  'name=Version 1'
+echo "backward compatibility: empty key persists and survives keyed interleaving"
+# The unkeyed persistent pool was first built by bootstrap's compat polls. It must
+# still be alive here, after the keyed cold round + warm alternation: keyed requests
+# must swap pools in and out without clobbering (leaking) the unkeyed one.
+expect compat  'before v1=true v2=false'  'name=Version 1'
+expect compat  'before v1=true v2=false'  'name=Version 1'
 
-echo "use-after-free guard: key set + keep=0 (key ignored) survives repeated requests"
-# Regression for the keyed-cache UAF: with keep off, the key must be ignored and the
-# legacy unkeyed path used. Before the fix, the first request registered a keyed pool
-# that RSHUTDOWN then freed, so the second same-key request reused freed memory and
-# (under MALLOC_PERTURB_, see docker-compose.yml) failed. Both must now succeed.
-# Only the success + value are asserted; the `before` state depends on whatever
-# unkeyed pool the preceding requests left, since keep=0 takes the unkeyed path.
-expect keep0   'name=Version 1'
-expect keep0   'name=Version 1'
+echo "use-after-free guard: key set + keep=0 (key ignored) is fully isolated"
+# Regression for the keyed-cache UAF: with keep off, the key must be ignored and a
+# fresh request-local pool used. Before the fix, the first request registered a keyed
+# pool that RSHUTDOWN then freed, so the second same-key request reused freed memory
+# and (under MALLOC_PERTURB_, see docker-compose.yml) failed. A keep=0 request must
+# also never adopt (or destroy) the persistent unkeyed pool: its `before` is always
+# empty, and the compat pool above stays intact afterwards.
+expect keep0   'before v1=false v2=false'  'name=Version 1'
+expect keep0   'before v1=false v2=false'  'name=Version 1'
+
+echo "persistent unkeyed pool survived the keep=0 requests"
+expect compat  'before v1=true v2=false'   'name=Version 1'
 
 echo "routing guard: unknown release is rejected"
 reject nope

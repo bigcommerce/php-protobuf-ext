@@ -42,10 +42,15 @@ Behavior when a non-empty key is set and persistence is on:
 
 The key only takes effect when persistence is on: keyed mode requires
 `keep_descriptor_pool_after_request=1`. If a key is set while persistence is off, the key is
-**ignored** and the request runs the unkeyed upstream path (a keyed pool would have nothing
-to persist into across requests). Both gates must agree — engaging the keyed cache on the key
-alone, without persistence, leaves a freed pool referenced by the cache on the next same-key
-request (a use-after-free; INFRA-25160).
+**ignored** and the request runs on a fresh request-local pool, exactly as upstream with
+`keep=0` (a keyed pool would have nothing to persist into across requests). A `keep=0`
+request is fully isolated: it never adopts — or tears down — a pool that a `keep=1` release
+built on the same worker.
+
+Both settings are **sampled once, at request startup**. Calling `ini_set()` on either of
+them mid-request has no effect on the pool lifecycle for that request (the decision taken at
+startup is what request shutdown acts on). Per-request configuration must come from
+`.user.ini` / `PHP_VALUE`, which apply before request startup.
 
 ## Enabling it
 
@@ -69,6 +74,11 @@ Use a **stable identifier that changes only when the proto definitions might cha
 for example a hash derived from the application's dependency lockfile, computed at
 build/deploy time. Versions that resolve to the same identifier share one pool, which keeps
 the number of live pools (and rebuilds) low.
+
+**Keys must be low-cardinality.** Every distinct key pins a full descriptor pool in the
+worker for the rest of its life — there is no eviction. A high-cardinality key (deploy ID,
+timestamp, request attribute) grows one pool per distinct value until the worker is
+recycled; worker recycling (`pm.max_requests`) is the only backstop.
 
 ### `user_ini.cache_ttl`
 
